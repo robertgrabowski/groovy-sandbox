@@ -18,6 +18,7 @@ import org.codehaus.groovy.control.customizers.CompilationCustomizer
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression
 import org.codehaus.groovy.ast.expr.BinaryExpression
 import org.codehaus.groovy.syntax.Types
+import org.codehaus.groovy.transform.NewifyASTTransformation;
 import org.codehaus.groovy.ast.expr.FieldExpression
 import org.codehaus.groovy.ast.expr.VariableExpression
 import org.kohsuke.groovy.sandbox.impl.Checker
@@ -66,20 +67,24 @@ class SandboxTransformer extends CompilationCustomizer {
     boolean interceptArray=true;
     boolean interceptAttribute=true;
 
+    private Expression interceptorMarker;
+    
     SandboxTransformer() {
         super(CompilePhase.CANONICALIZATION)
+        this.interceptorMarker = ConstantExpression.NULL
     }
-
+    
+    SandboxTransformer(GroovyInterceptor interceptor) {
+        super(CompilePhase.CANONICALIZATION)
+        this.interceptorMarker = new ConstantExpression(interceptor.uniqueId)
+    }
+    
     @Override
     void call(SourceUnit source, GeneratorContext context, ClassNode classNode) {
         def ast = source.getAST();
         def visitor = new VisitorImpl(source);
 
-        ast.methods?.each { visitor.visitMethod(it) }
-        classNode?.declaredConstructors?.each { visitor.visitMethod(it) }
-        classNode?.methods?.each { visitor.visitMethod(it) }
-        classNode?.objectInitializerStatements?.each { it.visit(visitor) }
-        classNode?.fields?.each { visitor.visitField(it) }
+        visitor.visitClass(classNode)
     }
 
     class VisitorImpl extends ClassCodeExpressionTransformer {
@@ -102,7 +107,7 @@ class SandboxTransformer extends CompilationCustomizer {
         
         Expression makeCheckedCall(String name, Collection<Expression> arguments) {
             return new StaticMethodCallExpression(checkerClass,name,
-                new ArgumentListExpression(arguments as Expression[]))
+                new ArgumentListExpression(([this.interceptorMarker] + arguments) as Expression[]))
         }
     
         @Override
@@ -230,7 +235,8 @@ class SandboxTransformer extends CompilationCustomizer {
             return v ? ConstantExpression.PRIM_TRUE : ConstantExpression.PRIM_FALSE
         }
 
-
+        ConstantExpression interceptorId() {
+        }
 
         @Override
         protected SourceUnit getSourceUnit() {
