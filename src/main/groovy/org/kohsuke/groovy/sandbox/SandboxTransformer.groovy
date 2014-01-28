@@ -5,9 +5,12 @@ import org.codehaus.groovy.ast.ClassNode
 import org.codehaus.groovy.ast.expr.ArgumentListExpression
 import org.codehaus.groovy.ast.expr.AttributeExpression
 import org.codehaus.groovy.ast.expr.ClassExpression
+import org.codehaus.groovy.ast.expr.ClosureExpression
 import org.codehaus.groovy.ast.expr.ConstantExpression
 import org.codehaus.groovy.ast.expr.Expression
+import org.codehaus.groovy.ast.expr.ListExpression
 import org.codehaus.groovy.ast.expr.MethodCallExpression
+import org.codehaus.groovy.ast.expr.MethodPointerExpression
 import org.codehaus.groovy.ast.expr.PropertyExpression
 import org.codehaus.groovy.ast.expr.StaticMethodCallExpression
 import org.codehaus.groovy.ast.expr.TupleExpression
@@ -21,6 +24,10 @@ import org.codehaus.groovy.syntax.Types
 import org.codehaus.groovy.ast.expr.FieldExpression
 import org.codehaus.groovy.ast.expr.VariableExpression
 import org.kohsuke.groovy.sandbox.impl.Checker
+import org.kohsuke.groovy.sandbox.impl.Ops
+import org.kohsuke.groovy.sandbox.impl.SandboxedMethodClosure
+
+import static org.codehaus.groovy.syntax.Types.*
 
 /**
  * Transforms Groovy code at compile-time to intercept when the script interacts with the outside world.
@@ -31,7 +38,9 @@ import org.kohsuke.groovy.sandbox.impl.Checker
  * every step of the script execution when it makes method calls and property/field/array access.
  *
  * <p>
- * Once the script is transformed, every intercepted operation results in a call to
+ * Once the script is transformed, every intercepted operation results in a call to {@link Checker},
+ * which further forwards the call to {@link GroovyInterceptor} for inspection.
+ *
  *
  * <p>
  * To use it, add it to the {@link org.codehaus.groovy.control.CompilerConfiguration}, like this:
@@ -60,10 +69,28 @@ import org.kohsuke.groovy.sandbox.impl.Checker
  * @author Kohsuke Kawaguchi
  */
 class SandboxTransformer extends CompilationCustomizer {
+    /**
+     * Intercept method calls
+     */
     boolean interceptMethodCall=true;
+    /**
+     * Intercept object instantiation by intercepting its constructor call.
+     *
+     * Note that Java byte code doesn't allow the interception of super(...) and this(...)
+     * so the object instantiation by defining and instantiating a subtype cannot be intercepted.
+     */
     boolean interceptConstructor=true;
+    /**
+     * Intercept property access for both read "(...).y" and write "(...).y=..."
+     */
     boolean interceptProperty=true;
+    /**
+     * Intercept array access for both read "y=a[x]" and write "a[x]=y"
+     */
     boolean interceptArray=true;
+    /**
+     * Intercept attribute access for both read "z=x.@y" and write "x.@y=z"
+     */
     boolean interceptAttribute=true;
 
     SandboxTransformer() {
@@ -89,10 +116,15 @@ class SandboxTransformer extends CompilationCustomizer {
          * Groovy primarily uses {@link ArgumentListExpression} for this,
          * but the signature doesn't guarantee that. So this method takes care of that.
          */
-        List<Expression> transformArguments(Expression e) {
+        Expression transformArguments(Expression e) {
+            List<Expression> l;
             if (e instanceof TupleExpression)
-                return e.expressions*.transformExpression(this)
-            return [e.transformExpression(this)];
+                l = e.expressions.collect { transform(it) };
+            else
+                l = [transform(e)];
+
+            // checkdCall expects an array
+            return new MethodCallExpression(new ListExpression(l),"toArray",new ArgumentListExpression());
         }
         
         Expression makeCheckedCall(String name, Collection<Expression> arguments) {
@@ -102,15 +134,25 @@ class SandboxTransformer extends CompilationCustomizer {
     
         @Override
         Expression transform(Expression exp) {
+            if (exp instanceof ClosureExpression) {
+                // ClosureExpression.transformExpression doesn't visit the code inside
+                ClosureExpression ce = (ClosureExpression)exp;
+                ce.code.visit(this)
+            }
 
             if (exp instanceof MethodCallExpression && interceptMethodCall) {
+                // lhs.foo(arg1,arg2) => checkedCall(lhs,"foo",arg1,arg2)
+                // lhs+rhs => lhs.plus(rhs)
+                // Integer.plus(Integer) => DefaultGroovyMethods.plus
+                // lhs || rhs => lhs.or(rhs)
                 MethodCallExpression call = exp;
                 return makeCheckedCall("checkedCall",[
                         transform(call.objectExpression),
                         boolExp(call.safe),
                         boolExp(call.spreadSafe),
-                        transform(call.method)
-                    ]+transformArguments(call.arguments))
+                        transform(call.method),
+                        transformArguments(call.arguments)
+                    ])
             }
             
             if (exp instanceof StaticMethodCallExpression && interceptMethodCall) {
@@ -124,16 +166,26 @@ class SandboxTransformer extends CompilationCustomizer {
                 StaticMethodCallExpression call = exp;
                 return makeCheckedCall("checkedStaticCall", [
                             new ClassExpression(call.ownerType),
-                            new ConstantExpression(call.method)
-                    ]+transformArguments(call.arguments))
+                            new ConstantExpression(call.method),
+                            transformArguments(call.arguments)
+                    ])
+            }
+
+            if (exp instanceof MethodPointerExpression && interceptMethodCall) {
+                MethodPointerExpression mpe = exp;
+                return new ConstructorCallExpression(
+                        new ClassNode(SandboxedMethodClosure.class),
+                        new ArgumentListExpression(mpe.expression, mpe.methodName)
+                )
             }
 
             if (exp instanceof ConstructorCallExpression && interceptConstructor) {
                 if (!exp.isSpecialCall()) {
                     // creating a new instance, like "new Foo(...)"
                     return makeCheckedCall("checkedConstructor", [
-                            new ClassExpression(exp.type)
-                    ]+transformArguments(exp.arguments))
+                            new ClassExpression(exp.type),
+                            transformArguments(exp.arguments)
+                    ])
                 } else {
                     // we can't really intercept constructor calling super(...) or this(...),
                     // since it has to be the first method call in a constructor.
@@ -160,8 +212,8 @@ class SandboxTransformer extends CompilationCustomizer {
 
             if (exp instanceof BinaryExpression) {
                 // this covers everything from a+b to a=b
-                if (exp.operation.type==Types.ASSIGN) {
-                    // TODO: there are whole bunch of other composite assignment operators like |=, +=, etc.
+                if (ofType(exp.operation.type,ASSIGNMENT_OPERATOR)) {
+                    // simple assignment like '=' as well as compound assignments like "+=","-=", etc.
 
                     // How we dispatch this depends on the type of left expression.
                     // 
@@ -186,7 +238,8 @@ class SandboxTransformer extends CompilationCustomizer {
                                 lhs.property,
                                 boolExp(lhs.safe),
                                 boolExp(lhs.spreadSafe),
-                                transform(exp.rightExpression)
+                                intExp(exp.operation.type),
+                                transform(exp.rightExpression),
                         ])
                     } else
                     if (lhs instanceof FieldExpression) {
@@ -204,15 +257,38 @@ class SandboxTransformer extends CompilationCustomizer {
                             return makeCheckedCall("checkedSetArray", [
                                     transform(lhs.leftExpression),
                                     transform(lhs.rightExpression),
+                                    intExp(exp.operation.type),
                                     transform(exp.rightExpression)
                             ])
                         }
                     } else
                         throw new AssertionError("Unexpected LHS of an assignment: ${lhs.class}")
                 }
-                if (exp.operation.type==Types.LEFT_SQUARE_BRACKET && interceptArray) {// array reference
-                    return makeCheckedCall("checkedGetArray", [
+                if (exp.operation.type==Types.LEFT_SQUARE_BRACKET) {// array reference
+                    if (interceptArray)
+                        return makeCheckedCall("checkedGetArray", [
+                                transform(exp.leftExpression),
+                                transform(exp.rightExpression)
+                        ])
+                } else
+                if (Ops.isLogicalOperator(exp.operation.type)) {
+                    return super.transform(exp);
+                } else
+                if (Ops.isComparisionOperator(exp.operation.type)) {
+                    if (interceptMethodCall) {
+                        return makeCheckedCall("checkedComparison", [
+                                transform(exp.leftExpression),
+                                intExp(exp.operation.type),
+                                transform(exp.rightExpression)
+                        ])
+                    }
+                } else
+                if (interceptMethodCall) {
+                    // normally binary operators like a+b
+                    // TODO: check what other weird binary operators land here
+                    return makeCheckedCall("checkedBinaryOp",[
                             transform(exp.leftExpression),
+                            intExp(exp.operation.type),
                             transform(exp.rightExpression)
                     ])
                 }
@@ -225,6 +301,9 @@ class SandboxTransformer extends CompilationCustomizer {
             return v ? ConstantExpression.PRIM_TRUE : ConstantExpression.PRIM_FALSE
         }
 
+        ConstantExpression intExp(int v) {
+            return new ConstantExpression(v,true);
+        }
 
 
         @Override

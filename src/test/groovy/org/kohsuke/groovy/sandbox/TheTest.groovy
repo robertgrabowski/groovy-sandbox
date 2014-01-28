@@ -1,5 +1,8 @@
 package org.kohsuke.groovy.sandbox
 
+import org.codehaus.groovy.control.customizers.ImportCustomizer
+import org.codehaus.groovy.runtime.NullObject
+
 import java.awt.Point
 import junit.framework.TestCase
 import org.codehaus.groovy.control.CompilerConfiguration
@@ -20,8 +23,10 @@ class TheTest extends TestCase {
         binding.zot = 5
         binding.point = new Point(1,2)
         binding.points = [new Point(1,2),new Point(3,4)]
+        binding.intArray = [0,1,2,3,4] as int[]
 
         def cc = new CompilerConfiguration()
+        cc.addCompilationCustomizers(new ImportCustomizer().addImports(TheTest.class.name))
         cc.addCompilationCustomizers(new SandboxTransformer())
         sh = new GroovyShell(binding,cc)
 
@@ -40,14 +45,15 @@ class TheTest extends TestCase {
     }
     
     def assertIntercept(String expectedCallSequence, Object expectedValue, String script) {
-        assertEquals(expectedValue,eval(script));
+        def actual = eval(script)
+        assertEquals(expectedValue, actual);
         assertEquals(expectedCallSequence.replace('/','\n').trim(), cr.toString().trim())
     }
 
     void testOK() {
         // instance call
         assertIntercept(
-                "Integer.class/Class.forName(String)",
+                "Integer.class/Class:forName(String)",
                 String.class,
                 "5.class.forName('java.lang.String')")
 
@@ -59,13 +65,13 @@ class TheTest extends TestCase {
 
         // static call
         assertIntercept(// turns out this doesn't actually result in onStaticCall
-                "Class.max(Float,Float)",
+                "Math:max(Float,Float)",
                 Math.max(1f,2f),
                 "Math.max(1f,2f)"
         )
 
         assertIntercept(// ... but this does
-                "Math.max(Float,Float)",
+                "Math:max(Float,Float)",
                 Math.max(1f,2f),
                 "import static java.lang.Math.*; max(1f,2f)"
         )
@@ -111,7 +117,7 @@ class TheTest extends TestCase {
         
         // array set & get
         assertIntercept(
-                "[I[Integer]=Integer/[I[Integer]",
+                "int[][Integer]=Integer/int[][Integer]",
                 1,
                 "x=new int[3];x[0]=1;x[0]"
         )
@@ -119,7 +125,7 @@ class TheTest extends TestCase {
 
     void testClosure() {
         assertIntercept(
-                "Script1\$_run_closure1.call()/Integer.class/Class.forName(String)",
+                "Script1\$_run_closure1.call()/Integer.class/Class:forName(String)",
                 null,
                 "def foo = { 5.class.forName('java.lang.String') }\n" +
                 "foo()\n" +
@@ -128,14 +134,14 @@ class TheTest extends TestCase {
 
     void testClass() {
         assertIntercept(
-                "Integer.class/Class.forName(String)",
+                "Integer.class/Class:forName(String)",
                 null,
                 "class foo { static void main(String[] args) { 5.class.forName('java.lang.String') } }")
     }
 
     void testInnerClass() {
         assertIntercept(
-                "Class.juu()/Integer.class/Class.forName(String)",
+                "foo\$bar:juu()/Integer.class/Class:forName(String)",
                 null,
                 "class foo {\n" +
                 "  class bar {\n" +
@@ -147,7 +153,7 @@ class TheTest extends TestCase {
 
     void testStaticInitializationBlock() {
         assertIntercept(
-                "Integer.class/Class.forName(String)",
+                "Integer.class/Class:forName(String)",
                 null,
                 "class foo {\n" +
                 "static { 5.class.forName('java.lang.String') }\n" +
@@ -157,7 +163,7 @@ class TheTest extends TestCase {
 
     void testConstructor() {
         assertIntercept(
-                "new foo()/Integer.class/Class.forName(String)",
+                "new foo()/Integer.class/Class:forName(String)",
                 null,
                 "class foo {\n" +
                 "foo() { 5.class.forName('java.lang.String') }\n" +
@@ -168,7 +174,7 @@ class TheTest extends TestCase {
 
     void testInitializationBlock() {
         assertIntercept(
-                "new foo()/Integer.class/Class.forName(String)",
+                "new foo()/Integer.class/Class:forName(String)",
                 null,
                 "class foo {\n" +
                         "{ 5.class.forName('java.lang.String') }\n" +
@@ -179,7 +185,7 @@ class TheTest extends TestCase {
 
     void testFieldInitialization() {
         assertIntercept(
-                "new foo()/Integer.class/Class.forName(String)",
+                "new foo()/Integer.class/Class:forName(String)",
                 null,
                 "class foo {\n" +
                         "def obj = 5.class.forName('java.lang.String')\n" +
@@ -190,7 +196,7 @@ class TheTest extends TestCase {
 
     void testStaticFieldInitialization() {
         assertIntercept(
-                "Integer.class/Class.forName(String)/new foo()",
+                "Integer.class/Class:forName(String)/new foo()",
                 null,
                 "class foo {\n" +
                         "static obj = 5.class.forName('java.lang.String')\n" +
@@ -198,4 +204,117 @@ class TheTest extends TestCase {
                         "new foo()\n" +
                         "return null")
     }
+
+    void testCompoundAssignment() {
+        assertIntercept(
+                "Point.x/Double.plus(Integer)/Point.x=Double",
+                (double)4.0,
+"""
+point.x += 3
+""")
+    }
+
+    void testCompoundAssignment2() {
+        // "[I" is the type name of int[]
+        assertIntercept(
+                "int[][Integer]/Integer.leftShift(Integer)/int[][Integer]=Integer",
+                1<<3,
+"""
+intArray[1] <<= 3;
+""")
+    }
+
+    void testComparison() {
+        assertIntercept(
+                "Point.equals(Point)/Integer.compareTo(Integer)",
+                true,
+"""
+point==point
+5==5
+""")
+    }
+
+    void testNestedClass() {
+        assertIntercept(
+                "new Script1\$1(Script1)/Script1\$1.plusOne(Integer)/Integer.plus(Integer)",
+                6,
+"""
+x = new Object() {
+   def plusOne(rhs) {
+     return rhs+1;
+   }
+}
+x.plusOne(5)
+""")
+    }
+
+    void testIssue2() {
+        assertIntercept("new HashMap()/HashMap.dummy/Script1.println(null)",null,"println(new HashMap().dummy);")
+        assertIntercept("Script2.println()",null,"println();")
+        assertIntercept("Script3.println(null)",null,"println(null);")
+    }
+
+    void testSystemExitAsFunction() {
+        assertIntercept("TheTest:idem(Integer)/TheTest:idem(Integer)",123,"org.kohsuke.groovy.sandbox.TheTest.idem(org.kohsuke.groovy.sandbox.TheTest.idem(123))")
+    }
+
+    /**
+     * Idempotent function used for testing
+     */
+    public static Object idem(Object o) {
+        return o;
+    }
+
+    void testArrayArgumentsInvocation() {
+        assertIntercept('new TheTest$MethodWithArrayArg()/TheTest$MethodWithArrayArg.f(Object[])', 3, "new TheTest.MethodWithArrayArg().f(new Object[3])")
+    }
+
+    public static class MethodWithArrayArg {
+        public Object f(Object[] arg) {
+            return arg.length;
+        }
+    }
+
+    /**
+     * See issue #6. We are not intercepting calls to null.
+     */
+    void testNull() {
+        assertIntercept("", NullObject.class, "x=null; null.getClass()")
+        assertIntercept("", "null3", "x=null; x.plus('3')")
+        assertIntercept("", false, "x=null; x==3")
+    }
+
+    /**
+     * See issue #9
+     */
+    void testAnd() {
+        assertIntercept("", false, """
+            String s = null
+            if (s != null && s.length > 0)
+              throw new Exception();
+            return false;
+            """)
+    }
+
+    void testLogicalNotEquals() {
+        assertIntercept("Integer.toString()/String.compareTo(String)", true,
+                "def x = 3.toString(); if (x != '') return true; else return false;")
+    }
+
+
+    // Groovy doesn't allow this?
+//    void testLocalClass() {
+//        assertIntercept(
+//                "new Foo()/Foo.plusOne(Integer)/Integer.plus(Integer)",
+//                7,
+//"""
+//class Foo {
+//   def plusTwo(rhs) {
+//     class Bar { def plusOne(rhs) { rhs + 2; } }
+//     return new Bar().plusOne(rhs)+1;
+//   }
+//}
+//new Foo().plusTwo(5)
+//""")
+//    }
 }

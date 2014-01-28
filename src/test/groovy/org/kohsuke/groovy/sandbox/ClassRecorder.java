@@ -26,6 +26,8 @@ public class ClassRecorder extends GroovyInterceptor {
     }
     
     private String type(Class c) {
+        if (c.isArray())
+            return type(c.getComponentType())+"[]";
         String n = c.getName();
         return n.substring(n.lastIndexOf('.')+1);
     }
@@ -47,7 +49,7 @@ public class ClassRecorder extends GroovyInterceptor {
 
     @Override
     public Object onStaticCall(Invoker invoker, Class receiver, String method, Object... args) throws Throwable {
-        format("%s.%s(%s)",type(receiver),method,arguments(args));
+        format("%s:%s(%s)",type(receiver),method,arguments(args));
         return super.onStaticCall(invoker, receiver, method, args);
     }
 
